@@ -29,7 +29,12 @@ PARALLEL_UPDATES = 1
 # The window-based app detection in the stock integration returns nothing on this TV.
 CMD_CURRENT_APP = "dumpsys activity activities | grep -m 1 mResumedActivity"
 CMD_SESSIONS = "dumpsys media_session | grep -E 'package=|state=PlaybackState'"
+# Some apps (e.g. Tennis TV) leave their media session empty but still publish an audio player.
+CMD_UID = "cmd package list packages -U {}"
+CMD_AUDIO = "dumpsys audio | grep AudioPlaybackConfiguration | grep -v SoundPool"
 
+RE_UID = re.compile(r"uid:(\d+)")
+RE_AUDIO = re.compile(r"u/pid:(\d+)/\d+ state:(\w+)")
 RE_APP = re.compile(r"u\d+ ([\w.]+)/")
 RE_PACKAGE = re.compile(r"package=([\w.]+)")
 RE_PLAYBACK_STATE = re.compile(r"state=PlaybackState \{state=(\d+)")
@@ -79,6 +84,7 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
     def __init__(self, entry: ConfigEntry) -> None:
         """Initialize the entity."""
         self._source_registry_id: str = entry.data[CONF_SOURCE]
+        self._uids: dict[str, int] = {}
         self._attr_unique_id = entry.entry_id
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)}, name=entry.title
@@ -119,18 +125,20 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         try:
             app_output = await aftv.adb_shell(CMD_CURRENT_APP)
             session_output = await aftv.adb_shell(CMD_SESSIONS)
+            if app_output is None and session_output is None:
+                self._attr_available = False
+                return
+
+            app_id = _parse_app(app_output or "")
+            playback = _parse_session_states(session_output or "").get(app_id)
+            if app_id and playback not in (PLAYBACK_PLAYING, PLAYBACK_PAUSED):
+                playback = await self._audio_playback(aftv, app_id)
         except Exception:  # noqa: BLE001
             _LOGGER.debug("ADB query failed", exc_info=True)
             self._attr_available = False
             return
 
-        if app_output is None and session_output is None:
-            self._attr_available = False
-            return
-
-        app_id = _parse_app(app_output or "")
-        playback = _parse_session_states(session_output or "").get(app_id)
-
+        _LOGGER.debug("app=%s playback=%s", app_id, playback)
         self._attr_app_id = app_id
         if playback == PLAYBACK_PLAYING:
             self._attr_state = MediaPlayerState.PLAYING
@@ -138,6 +146,26 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
             self._attr_state = MediaPlayerState.PAUSED
         else:
             self._attr_state = MediaPlayerState.IDLE
+
+    async def _audio_playback(self, aftv, app_id: str) -> int | None:
+        """Derive playback from the app's audio players."""
+        if app_id not in self._uids:
+            match = RE_UID.search(await aftv.adb_shell(CMD_UID.format(app_id)) or "")
+            if not match:
+                return None
+            self._uids[app_id] = int(match.group(1))
+
+        output = await aftv.adb_shell(CMD_AUDIO) or ""
+        states = {
+            state
+            for uid, state in RE_AUDIO.findall(output)
+            if int(uid) == self._uids[app_id]
+        }
+        if "started" in states:
+            return PLAYBACK_PLAYING
+        if "paused" in states:
+            return PLAYBACK_PAUSED
+        return None
 
     async def _forward(self, service: str) -> None:
         source_entry = self._source_entry()
