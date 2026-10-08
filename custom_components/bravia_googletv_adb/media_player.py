@@ -6,6 +6,7 @@ from datetime import timedelta
 import hashlib
 import logging
 import re
+from time import monotonic
 from xml.sax.saxutils import escape
 
 from androidtv.constants import APPS
@@ -18,10 +19,11 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import STATE_OFF, STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 
 from .const import CONF_SOURCE, DOMAIN
 
@@ -29,6 +31,10 @@ _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(seconds=5)
 PARALLEL_UPDATES = 1
+
+# How long a commanded play/pause state is kept while the TV catches up.
+PENDING_TIMEOUT = 6.0
+PENDING_REFRESH_DELAY = 1.5
 
 # The window-based app detection in the stock integration returns nothing on this TV.
 CMD_CURRENT_APP = "dumpsys activity activities | grep -m 1 mResumedActivity"
@@ -102,6 +108,8 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         """Initialize the entity."""
         self._source_registry_id: str = entry.data[CONF_SOURCE]
         self._uids: dict[str, int] = {}
+        self._pending: tuple[MediaPlayerState, float] | None = None
+        self._stale_art_hash: str | None = None
         self._attr_unique_id = entry.entry_id
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)}, name=entry.title
@@ -119,6 +127,12 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
     def _stock_entity(self, source_entry: er.RegistryEntry) -> MediaPlayerEntity | None:
         component = self.hass.data.get(DATA_COMPONENT)
         return component.get_entity(source_entry.entity_id) if component else None
+
+    def _stock_art_hash(self, source_entry: er.RegistryEntry) -> str | None:
+        """Stock art hash, ignoring the capture left over from the previous app."""
+        stock = self._stock_entity(source_entry)
+        art_hash = stock.media_image_hash if stock else None
+        return None if art_hash == self._stale_art_hash else art_hash
 
     async def async_update(self) -> None:
         """Read the foreground app and its media session over the existing ADB connection."""
@@ -139,6 +153,8 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
             self._attr_app_id = None
             self._attr_app_name = None
             self._attr_media_image_hash = None
+            self._stale_art_hash = None
+            self._pending = None
             return
 
         config_entry = self._stock_config_entry(source_entry)
@@ -164,24 +180,34 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
             return
 
         _LOGGER.debug("app=%s playback=%s", app_id, playback)
+        if self._attr_app_id is not None and app_id != self._attr_app_id:
+            stock = self._stock_entity(source_entry)
+            self._stale_art_hash = stock.media_image_hash if stock else None
         self._attr_app_id = app_id
         apps = {**APPS, **config_entry.options.get("apps", {})}
         self._attr_app_name = apps.get(app_id, app_id) if app_id else None
 
-        stock = self._stock_entity(source_entry)
-        if stock and stock.media_image_hash:
-            self._attr_media_image_hash = stock.media_image_hash
+        if art_hash := self._stock_art_hash(source_entry):
+            self._attr_media_image_hash = art_hash
         elif app_id:
             self._attr_media_image_hash = hashlib.sha256(app_id.encode()).hexdigest()[:16]
         else:
             self._attr_media_image_hash = None
 
         if playback == PLAYBACK_PLAYING:
-            self._attr_state = MediaPlayerState.PLAYING
+            state = MediaPlayerState.PLAYING
         elif playback == PLAYBACK_PAUSED:
-            self._attr_state = MediaPlayerState.PAUSED
+            state = MediaPlayerState.PAUSED
         else:
-            self._attr_state = MediaPlayerState.IDLE
+            state = MediaPlayerState.IDLE
+
+        if self._pending:
+            expected, deadline = self._pending
+            if state == expected or monotonic() > deadline:
+                self._pending = None
+            else:
+                state = expected
+        self._attr_state = state
 
     async def _audio_playback(self, aftv, app_id: str) -> int | None:
         """Derive playback from the app's audio players."""
@@ -207,7 +233,7 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         """Return the stock integration's screen capture, else per-app placeholder art."""
         source_entry = self._source_entry()
         stock = self._stock_entity(source_entry) if source_entry else None
-        if stock and stock.media_image_hash:
+        if source_entry and self._stock_art_hash(source_entry):
             return await stock.async_get_media_image()
         if self._attr_app_id:
             name = self._attr_app_name or self._attr_app_id
@@ -220,9 +246,19 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         config_entry = self._stock_config_entry(source_entry) if source_entry else None
         if config_entry is None:
             return
-        await config_entry.runtime_data.aftv.media_play_pause()
+        self._pending = (expected, monotonic() + PENDING_TIMEOUT)
         self._attr_state = expected
         self.async_write_ha_state()
+        try:
+            await config_entry.runtime_data.aftv.media_play_pause()
+        except Exception:
+            self._pending = None
+            raise
+        async_call_later(self.hass, PENDING_REFRESH_DELAY, self._refresh)
+
+    @callback
+    def _refresh(self, _now) -> None:
+        self.async_schedule_update_ha_state(True)
 
     async def async_media_play(self) -> None:
         """Resume playback if paused."""
