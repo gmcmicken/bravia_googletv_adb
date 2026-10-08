@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import hashlib
 import logging
 import re
+from xml.sax.saxutils import escape
+
+from androidtv.constants import APPS
 
 from homeassistant.components.media_player import (
-    DOMAIN as MEDIA_PLAYER_DOMAIN,
+    DATA_COMPONENT,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import STATE_OFF, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -62,6 +66,19 @@ def _parse_session_states(output: str) -> dict[str, int]:
     return states
 
 
+def _placeholder_svg(app_id: str, app_name: str) -> bytes:
+    """Stand-in art, coloured per app, until real app art is added."""
+    hue = int(hashlib.sha256(app_id.encode()).hexdigest()[:4], 16) % 360
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">'
+        f'<rect width="512" height="512" fill="hsl({hue},45%,30%)"/>'
+        '<text x="256" y="300" font-size="220" font-family="sans-serif" '
+        f'fill="white" text-anchor="middle">{escape(app_name[:1].upper())}</text>'
+        '<text x="256" y="440" font-size="44" font-family="sans-serif" '
+        f'fill="white" text-anchor="middle">{escape(app_name)}</text></svg>'
+    ).encode()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -93,6 +110,16 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
     def _source_entry(self) -> er.RegistryEntry | None:
         return er.async_get(self.hass).async_get(self._source_registry_id)
 
+    def _stock_config_entry(self, source_entry: er.RegistryEntry) -> ConfigEntry | None:
+        if not source_entry.config_entry_id:
+            return None
+        entry = self.hass.config_entries.async_get_entry(source_entry.config_entry_id)
+        return entry if entry and entry.state is ConfigEntryState.LOADED else None
+
+    def _stock_entity(self, source_entry: er.RegistryEntry) -> MediaPlayerEntity | None:
+        component = self.hass.data.get(DATA_COMPONENT)
+        return component.get_entity(source_entry.entity_id) if component else None
+
     async def async_update(self) -> None:
         """Read the foreground app and its media session over the existing ADB connection."""
         source_entry = self._source_entry()
@@ -110,14 +137,12 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         if source_state.state == STATE_OFF:
             self._attr_state = MediaPlayerState.OFF
             self._attr_app_id = None
+            self._attr_app_name = None
+            self._attr_media_image_hash = None
             return
 
-        config_entry = (
-            self.hass.config_entries.async_get_entry(source_entry.config_entry_id)
-            if source_entry and source_entry.config_entry_id
-            else None
-        )
-        if config_entry is None or config_entry.state is not ConfigEntryState.LOADED:
+        config_entry = self._stock_config_entry(source_entry)
+        if config_entry is None:
             self._attr_available = False
             return
 
@@ -140,6 +165,17 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
 
         _LOGGER.debug("app=%s playback=%s", app_id, playback)
         self._attr_app_id = app_id
+        apps = {**APPS, **config_entry.options.get("apps", {})}
+        self._attr_app_name = apps.get(app_id, app_id) if app_id else None
+
+        stock = self._stock_entity(source_entry)
+        if stock and stock.media_image_hash:
+            self._attr_media_image_hash = stock.media_image_hash
+        elif app_id:
+            self._attr_media_image_hash = hashlib.sha256(app_id.encode()).hexdigest()[:16]
+        else:
+            self._attr_media_image_hash = None
+
         if playback == PLAYBACK_PLAYING:
             self._attr_state = MediaPlayerState.PLAYING
         elif playback == PLAYBACK_PAUSED:
@@ -167,21 +203,33 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
             return PLAYBACK_PAUSED
         return None
 
-    async def _forward(self, service: str) -> None:
+    async def async_get_media_image(self) -> tuple[bytes | None, str | None]:
+        """Return the stock integration's screen capture, else per-app placeholder art."""
         source_entry = self._source_entry()
-        if source_entry is None:
+        stock = self._stock_entity(source_entry) if source_entry else None
+        if stock and stock.media_image_hash:
+            return await stock.async_get_media_image()
+        if self._attr_app_id:
+            name = self._attr_app_name or self._attr_app_id
+            return _placeholder_svg(self._attr_app_id, name), "image/svg+xml"
+        return None, None
+
+    async def _toggle_play_pause(self, expected: MediaPlayerState) -> None:
+        # Apps like Tennis TV ignore the discrete play/pause keys; only the toggle works.
+        source_entry = self._source_entry()
+        config_entry = self._stock_config_entry(source_entry) if source_entry else None
+        if config_entry is None:
             return
-        await self.hass.services.async_call(
-            MEDIA_PLAYER_DOMAIN,
-            service,
-            {ATTR_ENTITY_ID: source_entry.entity_id},
-            blocking=True,
-        )
+        await config_entry.runtime_data.aftv.media_play_pause()
+        self._attr_state = expected
+        self.async_write_ha_state()
 
     async def async_media_play(self) -> None:
-        """Play via the Android Debug Bridge player."""
-        await self._forward("media_play")
+        """Resume playback if paused."""
+        if self._attr_state == MediaPlayerState.PAUSED:
+            await self._toggle_play_pause(MediaPlayerState.PLAYING)
 
     async def async_media_pause(self) -> None:
-        """Pause via the Android Debug Bridge player."""
-        await self._forward("media_pause")
+        """Pause playback if playing."""
+        if self._attr_state == MediaPlayerState.PLAYING:
+            await self._toggle_play_pause(MediaPlayerState.PAUSED)
