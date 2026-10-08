@@ -13,12 +13,18 @@ from androidtv.constants import APPS
 
 from homeassistant.components.media_player import (
     DATA_COMPONENT,
+    DOMAIN as MEDIA_PLAYER_DOMAIN,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.const import STATE_OFF, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    STATE_OFF,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -37,6 +43,8 @@ PENDING_TIMEOUT = 6.0
 PENDING_REFRESH_DELAY = 1.5
 # The stock entity polls slowly, so it can lag behind a power-on.
 POWER_ON_TIMEOUT = 15.0
+# Same lag applies to volume: the stock entity reports it on its own slow poll.
+VOLUME_HOLD = 15.0
 
 # The window-based app detection in the stock integration returns nothing on this TV.
 CMD_CURRENT_APP = "dumpsys activity activities | grep -m 1 mResumedActivity"
@@ -108,6 +116,9 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         | MediaPlayerEntityFeature.STOP
         | MediaPlayerEntityFeature.TURN_ON
         | MediaPlayerEntityFeature.TURN_OFF
+        | MediaPlayerEntityFeature.VOLUME_SET
+        | MediaPlayerEntityFeature.VOLUME_MUTE
+        | MediaPlayerEntityFeature.VOLUME_STEP
     )
 
     def __init__(self, entry: ConfigEntry) -> None:
@@ -116,6 +127,7 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         self._uids: dict[str, int] = {}
         self._pending: tuple[MediaPlayerState, float] | None = None
         self._on_until = 0.0
+        self._volume_until = 0.0
         self._stale_art_hash: str | None = None
         self._attr_unique_id = entry.entry_id
         self._attr_device_info = DeviceInfo(
@@ -179,6 +191,10 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         if config_entry is None:
             self._attr_available = False
             return
+
+        if monotonic() >= self._volume_until:
+            self._attr_volume_level = source_state.attributes.get("volume_level")
+            self._attr_is_volume_muted = source_state.attributes.get("is_volume_muted")
 
         aftv = config_entry.runtime_data.aftv
         try:
@@ -291,6 +307,48 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
     def _command_entry(self) -> ConfigEntry | None:
         source_entry = self._source_entry()
         return self._stock_config_entry(source_entry) if source_entry else None
+
+    async def _forward_volume(self, service: str, data: dict | None = None) -> None:
+        """Call a volume service on the stock entity and mirror the result."""
+        source_entry = self._source_entry()
+        if source_entry is None:
+            return
+        await self.hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            service,
+            {ATTR_ENTITY_ID: source_entry.entity_id, **(data or {})},
+            blocking=True,
+        )
+        self._volume_until = monotonic() + VOLUME_HOLD
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Set the volume on the stock entity."""
+        await self._forward_volume("volume_set", {"volume_level": volume})
+        self._attr_volume_level = volume
+        self.async_write_ha_state()
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        """Mute or unmute via the stock entity."""
+        await self._forward_volume("volume_mute", {"is_volume_muted": mute})
+        self._attr_is_volume_muted = mute
+        self.async_write_ha_state()
+
+    async def async_volume_up(self) -> None:
+        """Step the volume up via the stock entity."""
+        await self._forward_volume("volume_up")
+        self._mirror_stock_volume()
+
+    async def async_volume_down(self) -> None:
+        """Step the volume down via the stock entity."""
+        await self._forward_volume("volume_down")
+        self._mirror_stock_volume()
+
+    def _mirror_stock_volume(self) -> None:
+        source_entry = self._source_entry()
+        state = self.hass.states.get(source_entry.entity_id) if source_entry else None
+        if state is not None:
+            self._attr_volume_level = state.attributes.get("volume_level")
+            self.async_write_ha_state()
 
     async def async_media_stop(self) -> None:
         """Return to the launcher."""
