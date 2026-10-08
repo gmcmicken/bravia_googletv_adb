@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Bravia Google TV ADB Playback",
+        "description": "Choose the Android Debug Bridge media player for your TV. A new media player reporting playing/paused state is created.",
+        "data": {
+          "source_entity": "Android Debug Bridge media player",
+          "name": "Name"
+        }
+      }
+    },
+    "error": {
+      "entity_not_registered": "That entity isn't in the entity registry."
+    },
+    "abort": {
+      "already_configured": "This media player is already configured."
+    }
+  }
+}

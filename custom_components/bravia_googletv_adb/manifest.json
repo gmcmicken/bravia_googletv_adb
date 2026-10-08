@@ -1,0 +1,13 @@
+{
+  "domain": "bravia_googletv_adb",
+  "name": "Bravia Google TV ADB Playback",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["androidtv"],
+  "documentation": "https://github.com/gmcmicken/bravia_googletv_adb",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/gmcmicken/bravia_googletv_adb/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
