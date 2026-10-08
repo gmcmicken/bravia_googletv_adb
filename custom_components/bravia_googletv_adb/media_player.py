@@ -9,7 +9,7 @@ import re
 from time import monotonic
 from xml.sax.saxutils import escape
 
-from androidtv.constants import APPS
+from androidtv.constants import APP_ATV_LAUNCHER, APP_GOOGLE_TV_LAUNCHER, APPS
 
 from homeassistant.components.media_player import (
     DATA_COMPONENT,
@@ -35,6 +35,8 @@ PARALLEL_UPDATES = 1
 # How long a commanded play/pause state is kept while the TV catches up.
 PENDING_TIMEOUT = 6.0
 PENDING_REFRESH_DELAY = 1.5
+
+LAUNCHERS = {APP_ATV_LAUNCHER, APP_GOOGLE_TV_LAUNCHER}
 
 # The window-based app detection in the stock integration returns nothing on this TV.
 CMD_CURRENT_APP = "dumpsys activity activities | grep -m 1 mResumedActivity"
@@ -101,7 +103,10 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
     _attr_name = None
     _attr_should_poll = True
     _attr_supported_features = (
-        MediaPlayerEntityFeature.PLAY | MediaPlayerEntityFeature.PAUSE
+        MediaPlayerEntityFeature.PLAY
+        | MediaPlayerEntityFeature.PAUSE
+        | MediaPlayerEntityFeature.STOP
+        | MediaPlayerEntityFeature.TURN_OFF
     )
 
     def __init__(self, entry: ConfigEntry) -> None:
@@ -148,6 +153,13 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
             return
 
         self._attr_available = True
+        if (
+            self._pending
+            and self._pending[0] == MediaPlayerState.OFF
+            and source_state.state != STATE_OFF
+            and monotonic() <= self._pending[1]
+        ):
+            return
         if source_state.state == STATE_OFF:
             self._attr_state = MediaPlayerState.OFF
             self._attr_app_id = None
@@ -269,3 +281,32 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         """Pause playback if playing."""
         if self._attr_state == MediaPlayerState.PLAYING:
             await self._toggle_play_pause(MediaPlayerState.PAUSED)
+
+    def _command_entry(self) -> ConfigEntry | None:
+        source_entry = self._source_entry()
+        return self._stock_config_entry(source_entry) if source_entry else None
+
+    async def async_media_stop(self) -> None:
+        """Exit the current app and return to the launcher."""
+        config_entry = self._command_entry()
+        if config_entry is None:
+            return
+        aftv = config_entry.runtime_data.aftv
+        if self._attr_app_id and self._attr_app_id not in LAUNCHERS:
+            await aftv.stop_app(self._attr_app_id)
+        await aftv.home()
+        async_call_later(self.hass, PENDING_REFRESH_DELAY, self._refresh)
+
+    async def async_turn_off(self) -> None:
+        """Turn the TV off, honouring the stock integration's custom command."""
+        config_entry = self._command_entry()
+        if config_entry is None:
+            return
+        aftv = config_entry.runtime_data.aftv
+        if command := config_entry.options.get("turn_off_command"):
+            await aftv.adb_shell(command)
+        else:
+            await aftv.turn_off()
+        self._pending = (MediaPlayerState.OFF, monotonic() + PENDING_TIMEOUT)
+        self._attr_state = MediaPlayerState.OFF
+        self.async_write_ha_state()
