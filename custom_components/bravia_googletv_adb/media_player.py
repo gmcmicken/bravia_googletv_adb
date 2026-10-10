@@ -9,7 +9,7 @@ import re
 from time import monotonic
 from xml.sax.saxutils import escape
 
-from androidtv.constants import APPS
+from androidtv.constants import APPS, KEY_HDMI1, KEY_HDMI2, KEY_HDMI3, KEY_HDMI4
 
 from homeassistant.components.media_player import (
     DATA_COMPONENT,
@@ -45,6 +45,13 @@ PENDING_REFRESH_DELAY = 1.5
 POWER_ON_TIMEOUT = 15.0
 # Same lag applies to volume: the stock entity reports it on its own slow poll.
 VOLUME_HOLD = 15.0
+RECENT_APPS_REFRESH = 30.0
+HDMI_SOURCES = {
+    "HDMI 1": KEY_HDMI1,
+    "HDMI 2": KEY_HDMI2,
+    "HDMI 3": KEY_HDMI3,
+    "HDMI 4": KEY_HDMI4,
+}
 
 # The window-based app detection in the stock integration returns nothing on this TV.
 CMD_CURRENT_APP = "dumpsys activity activities | grep -m 1 mResumedActivity"
@@ -52,12 +59,16 @@ CMD_SESSIONS = "dumpsys media_session | grep -E 'package=|state=PlaybackState'"
 # Some apps (e.g. Tennis TV) leave their media session empty but still publish an audio player.
 CMD_UID = "cmd package list packages -U {}"
 CMD_AUDIO = "dumpsys audio | grep AudioPlaybackConfiguration | grep -v SoundPool"
+CMD_RECENT_APPS = "dumpsys activity recents | grep 'Recent #'"
+CMD_INSTALLED_THIRD_PARTY = "pm list packages -3"
 
 RE_UID = re.compile(r"uid:(\d+)")
 RE_AUDIO = re.compile(r"u/pid:(\d+)/\d+ state:(\w+)")
 RE_APP = re.compile(r"u\d+ ([\w.]+)/")
 RE_PACKAGE = re.compile(r"package=([\w.]+)")
 RE_PLAYBACK_STATE = re.compile(r"state=PlaybackState \{state=(\d+)")
+RE_RECENT_PACKAGE = re.compile(r"A=\d+:(?:android:)?([\w.]+)")
+RE_INSTALLED_PACKAGE = re.compile(r"package:([\w.]+)")
 
 # android.media.session.PlaybackState
 PLAYBACK_PAUSED = 2
@@ -119,6 +130,7 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         | MediaPlayerEntityFeature.VOLUME_SET
         | MediaPlayerEntityFeature.VOLUME_MUTE
         | MediaPlayerEntityFeature.VOLUME_STEP
+        | MediaPlayerEntityFeature.SELECT_SOURCE
     )
 
     def __init__(self, entry: ConfigEntry) -> None:
@@ -129,6 +141,8 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         self._on_until = 0.0
         self._volume_until = 0.0
         self._stale_art_hash: str | None = None
+        self._recent_apps: list[str] = []
+        self._recent_apps_refreshed = 0.0
         self._attr_unique_id = entry.entry_id
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)}, name=entry.title
@@ -220,6 +234,17 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         self._attr_app_id = app_id
         apps = {**APPS, **config_entry.options.get("apps", {})}
         self._attr_app_name = apps.get(app_id, app_id) if app_id else None
+        await self._refresh_recent_apps(aftv, apps)
+        self._attr_source_list = [
+            "Home",
+            *HDMI_SOURCES,
+            *(apps.get(package, package) for package in self._recent_apps),
+        ]
+        hdmi_input = source_state.attributes.get("hdmi_input")
+        if hdmi_input and hdmi_input.startswith("HW"):
+            self._attr_source = f"HDMI {hdmi_input[2:]}"
+        else:
+            self._attr_source = self._attr_app_name
 
         if art_hash := self._stock_art_hash(source_entry):
             self._attr_media_image_hash = art_hash
@@ -242,6 +267,37 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
             else:
                 state = expected
         self._attr_state = state
+
+    async def _refresh_recent_apps(self, aftv, apps: dict[str, str]) -> None:
+        """Refresh recent third-party apps occasionally; Android also lists system tasks."""
+        if monotonic() - self._recent_apps_refreshed < RECENT_APPS_REFRESH:
+            return
+        self._recent_apps_refreshed = monotonic()
+        try:
+            output = await aftv.adb_shell(
+                f"{CMD_RECENT_APPS}; {CMD_INSTALLED_THIRD_PARTY}"
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Could not refresh recent apps", exc_info=True)
+            return
+
+        if not output:
+            self._recent_apps = []
+            return
+
+        installed = set(RE_INSTALLED_PACKAGE.findall(output))
+        recent = []
+        for line in output.splitlines():
+            if not line.startswith("  * Recent #"):
+                continue
+            match = RE_RECENT_PACKAGE.search(line)
+            if (
+                match
+                and (match.group(1) in installed or match.group(1) in apps)
+                and match.group(1) not in recent
+            ):
+                recent.append(match.group(1))
+        self._recent_apps = recent
 
     async def _audio_playback(self, aftv, app_id: str) -> int | None:
         """Derive playback from the app's audio players."""
@@ -303,6 +359,24 @@ class BraviaPlaybackPlayer(MediaPlayerEntity):
         """Pause playback if playing."""
         if self._attr_state == MediaPlayerState.PLAYING:
             await self._toggle_play_pause(MediaPlayerState.PAUSED)
+
+    async def async_select_source(self, source: str) -> None:
+        """Launch Home, an HDMI input, or a recent app."""
+        config_entry = self._command_entry()
+        if config_entry is None:
+            return
+        aftv = config_entry.runtime_data.aftv
+        if source == "Home":
+            await aftv.home()
+        elif source in HDMI_SOURCES:
+            await aftv.adb_shell(f"input keyevent {HDMI_SOURCES[source]}")
+        else:
+            apps = {**APPS, **config_entry.options.get("apps", {})}
+            app_id = next(
+                (package for package, name in apps.items() if name == source), source
+            )
+            await aftv.launch_app(app_id)
+        async_call_later(self.hass, PENDING_REFRESH_DELAY, self._refresh)
 
     def _command_entry(self) -> ConfigEntry | None:
         source_entry = self._source_entry()
